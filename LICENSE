@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2026 Jacek Juraszek
+Copyright (c) 2026 Jacek Juraszek (original pi-quiver provider-stall-watchdog)
+Copyright (c) 2026 Marcelino Llano (pi-watchdog modifications)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

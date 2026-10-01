@@ -4,13 +4,41 @@
   "description": "Provider-stall watchdog for Pi: aborts hung model requests and automatically re-drives the run with a hidden \"Continue.\" so you don't have to.",
   "type": "module",
   "license": "MIT",
-  "main": "src/index.ts",
-  "files": ["src", "docs", "README.md", "LICENSE"],
-  "pi": {
-    "extensions": ["./src/index.ts"]
+  "author": "Marcelino Llano (https://github.com/marcelinollano)",
+  "contributors": [
+    "Jacek Juraszek (https://github.com/jjuraszek) — original author of provider-stall-watchdog in pi-quiver"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marcelinollano/pi-watchdog.git"
   },
-  "keywords": ["pi-package", "pi-extension", "watchdog", "retry", "stall", "bedrock"],
-  "engines": { "node": ">=20" },
+  "homepage": "https://github.com/marcelinollano/pi-watchdog#readme",
+  "bugs": {
+    "url": "https://github.com/marcelinollano/pi-watchdog/issues"
+  },
+  "main": "src/index.ts",
+  "files": [
+    "src",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "watchdog",
+    "retry",
+    "stall",
+    "bedrock"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "test": "node --test \"test/*.test.ts\"",
     "typecheck": "tsc --noEmit",
