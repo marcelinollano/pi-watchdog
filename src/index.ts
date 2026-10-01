@@ -12,6 +12,7 @@
  * On a stall it aborts, hides the aborted attempt from model context, waits Pi's
  * retry backoff, and re-drives the run with a hidden "Continue." message.
  */
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { SETTINGS_KEY, readSettings, resolveConfig, settingsPaths } from "./config.ts";
 
@@ -22,7 +23,15 @@ export const DEFAULT_CONFIG = {
 	warningMs: 120_000,
 	recoveryMs: 240_000,
 	models: {},
+	/**
+	 * Case-insensitive regex sources for provider errors that are transient but worded so Pi's own
+	 * retry classifier misses them (e.g. sf-llm-gateway rewrites a raw "terminated" stream drop).
+	 */
+	retryErrorPatterns: ["ended before local completion", "retryable transport failure"],
 } as const;
+
+/** Appended to a matched error so Pi's retry classifier (which matches "terminated") retries it. */
+export const RETRYABLE_MARKER = "[pi-watchdog: transient transport failure - stream terminated early; retrying]";
 
 export type WatchdogThresholds = {
 	firstEventMs: number;
@@ -35,6 +44,8 @@ export type WatchdogConfig = WatchdogThresholds & {
 	maxStallRetries: number;
 	/** Per-model threshold overrides keyed by glob; see thresholdsFor. */
 	models: Record<string, Partial<WatchdogThresholds>>;
+	/** Regex sources (case-insensitive) for errors to make retryable; see DEFAULT_CONFIG. */
+	retryErrorPatterns: string[];
 };
 
 export type WatchdogRuntime = {
@@ -51,6 +62,7 @@ export type ConfigCandidate = {
 	recoveryMs?: unknown;
 	maxStallRetries?: unknown;
 	models?: unknown;
+	retryErrorPatterns?: unknown;
 };
 
 export type ConfigValidation =
@@ -66,7 +78,7 @@ export function coerce(raw: unknown): ConfigCandidate | undefined {
 
 	const source = raw as Record<string, unknown>;
 	const candidate: ConfigCandidate = { blockIsObject: true };
-	for (const key of ["enabled", "firstEventMs", "warningMs", "recoveryMs", "maxStallRetries", "models"] as const) {
+	for (const key of ["enabled", "firstEventMs", "warningMs", "recoveryMs", "maxStallRetries", "models", "retryErrorPatterns"] as const) {
 		if (Object.hasOwn(source, key)) candidate[key] = source[key];
 	}
 	return candidate;
@@ -100,6 +112,11 @@ export function validateConfig(candidate: ConfigCandidate): ConfigValidation {
 			return { ok: false, error: `models["${pattern}"] leaves warningMs (${mergedWarning}) >= recoveryMs (${mergedRecovery})` };
 		}
 	}
+	if (!Array.isArray(candidate.retryErrorPatterns)) return { ok: false, error: "retryErrorPatterns must be an array of regex strings" };
+	for (const pattern of candidate.retryErrorPatterns) {
+		if (typeof pattern !== "string" || pattern.length === 0) return { ok: false, error: "retryErrorPatterns entries must be non-empty strings" };
+		try { new RegExp(pattern, "i"); } catch { return { ok: false, error: `retryErrorPatterns entry "${pattern}" is not a valid regex` }; }
+	}
 	return {
 		ok: true,
 		config: {
@@ -109,6 +126,7 @@ export function validateConfig(candidate: ConfigCandidate): ConfigValidation {
 			recoveryMs: candidate.recoveryMs,
 			maxStallRetries: candidate.maxStallRetries,
 			models: candidate.models as Record<string, Partial<WatchdogThresholds>>,
+			retryErrorPatterns: [...(candidate.retryErrorPatterns as string[])],
 		},
 	};
 }
@@ -221,6 +239,24 @@ export function thresholdsFor(config: WatchdogConfig, model: { provider: string;
 		if (modelPattern(pattern).test(label)) return { ...base, ...override };
 	}
 	return base;
+}
+
+/**
+ * If `message` is an error Pi's retry classifier rejects but one of the configured patterns matches,
+ * return the error text with RETRYABLE_MARKER appended so Pi's native retry takes over. Returns
+ * undefined when Pi would already retry it, when nothing matches, or when the error stays
+ * non-retryable even with the marker (quota/billing exhaustion must never be retried).
+ */
+export function retryableErrorMessage(
+	message: { role: string; stopReason?: string; errorMessage?: string },
+	patterns: readonly string[],
+): string | undefined {
+	if (message.role !== "assistant" || message.stopReason !== "error" || !message.errorMessage) return undefined;
+	if (message.errorMessage.includes(RETRYABLE_MARKER)) return undefined;
+	if (isRetryableAssistantError(message as never)) return undefined;
+	if (!patterns.some((pattern) => new RegExp(pattern, "i").test(message.errorMessage!))) return undefined;
+	const errorMessage = `${message.errorMessage}\n${RETRYABLE_MARKER}`;
+	return isRetryableAssistantError({ ...message, errorMessage } as never) ? errorMessage : undefined;
 }
 
 export function createProviderStallWatchdog(runtime: WatchdogRuntime = defaultRuntime): (pi: ExtensionAPI) => void {
@@ -462,7 +498,14 @@ export function createProviderStallWatchdog(runtime: WatchdogRuntime = defaultRu
 			disarm();
 			// Mirror Pi's retry loop, which resets its attempt counter on any successful assistant turn.
 			if (event.message.stopReason !== "aborted" && event.message.stopReason !== "error") { stallRetriesUsed = 0; convertedTimeout = false; redrivePending = false; redriveEligible = false; }
-			if (!matchesWatchdogAbort) return;
+			if (!matchesWatchdogAbort) {
+				// Hand transient errors Pi misclassifies to Pi's own retry loop (backoff, retry.maxRetries,
+				// failed attempt omitted from context). Must run after the provider extension's own
+				// message_end rewrite, which holds when pi-watchdog loads after it.
+				if (!config?.enabled) return;
+				const retryable = retryableErrorMessage(event.message, config.retryErrorPatterns);
+				return retryable === undefined ? undefined : { message: { ...event.message, errorMessage: retryable } };
+			}
 			convertedTimeout = true;
 			redrivePending = true;
 			redriveEligible = false;

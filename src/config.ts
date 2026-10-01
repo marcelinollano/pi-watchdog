@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export const SETTINGS_KEY = "piWatchdog";
-export const CONFIG_FIELDS = ["enabled", "firstEventMs", "warningMs", "recoveryMs", "maxStallRetries", "models"] as const;
+export const CONFIG_FIELDS = ["enabled", "firstEventMs", "warningMs", "recoveryMs", "maxStallRetries", "models", "retryErrorPatterns"] as const;
 
 export function readSettings(path: string): Record<string, unknown> | undefined {
 	try {

@@ -13,7 +13,10 @@ import {
 	defineTool,
 } from "@earendil-works/pi-coding-agent";
 import piWatchdog, {
+	DEFAULT_CONFIG,
 	MAX_TIMER_MS,
+	RETRYABLE_MARKER,
+	retryableErrorMessage,
 	coerce,
 	createProviderStallWatchdog,
 	redriveDelayMs,
@@ -24,6 +27,13 @@ import piWatchdog, {
 	type ConfigCandidate,
 	type WatchdogConfig,
 } from "../src/index.ts";
+
+const DEFAULT_RETRY_ERROR_PATTERNS = [...DEFAULT_CONFIG.retryErrorPatterns];
+const SF_GATEWAY_STREAM_ERROR = [
+	"SF LLM Gateway stream for sf-llm-gateway/gpt-6-sol ended before local completion.",
+	"This is a retryable transport failure, not proof that the model rejected the request.",
+	"Run /sf-llm-gateway doctor; Pi agent retries apply when retry.enabled is true.",
+].join("\n");
 
 test("coerce: boolean shorthand toggles enabled", () => {
 	assert.deepEqual(coerce(true), { blockIsObject: true, enabled: true });
@@ -49,13 +59,13 @@ test("coerce preserves recognized values without type filtering", () => {
 
 test("validateConfig accepts a complete valid candidate", () => {
 	assert.deepEqual(
-		validateConfig({ blockIsObject: true, enabled: true, firstEventMs: 20_000, warningMs: 120_000, recoveryMs: 240_000, maxStallRetries: 3, models: { "lmstudio/*": { firstEventMs: 600_000, recoveryMs: 600_000 } } }),
-		{ ok: true, config: { enabled: true, firstEventMs: 20_000, warningMs: 120_000, recoveryMs: 240_000, maxStallRetries: 3, models: { "lmstudio/*": { firstEventMs: 600_000, recoveryMs: 600_000 } } } },
+		validateConfig({ blockIsObject: true, enabled: true, firstEventMs: 20_000, warningMs: 120_000, recoveryMs: 240_000, maxStallRetries: 3, models: { "lmstudio/*": { firstEventMs: 600_000, recoveryMs: 600_000 } }, retryErrorPatterns: ["x"] }),
+		{ ok: true, config: { enabled: true, firstEventMs: 20_000, warningMs: 120_000, recoveryMs: 240_000, maxStallRetries: 3, models: { "lmstudio/*": { firstEventMs: 600_000, recoveryMs: 600_000 } }, retryErrorPatterns: ["x"] } },
 	);
 });
 
 test("validateConfig fails closed for invalid values", () => {
-	const valid = { blockIsObject: true, enabled: true, firstEventMs: 20_000, warningMs: 120_000, recoveryMs: 240_000, maxStallRetries: 3, models: {} };
+	const valid = { blockIsObject: true, enabled: true, firstEventMs: 20_000, warningMs: 120_000, recoveryMs: 240_000, maxStallRetries: 3, models: {}, retryErrorPatterns: [] as unknown };
 	const cases: Array<{ name: string; candidate: ConfigCandidate }> = [
 		{ name: "non-object block", candidate: { ...valid, blockIsObject: false } },
 		{ name: "enabled wrong type", candidate: { ...valid, enabled: "true" } },
@@ -88,6 +98,11 @@ test("validateConfig fails closed for invalid values", () => {
 		{ name: "non-finite firstEvent", candidate: { ...valid, firstEventMs: Infinity } },
 		{ name: "missing firstEventMs", candidate: { ...valid, firstEventMs: undefined } },
 		{ name: "firstEvent above node maximum", candidate: { ...valid, firstEventMs: MAX_TIMER_MS + 1 } },
+		{ name: "missing retryErrorPatterns", candidate: { ...valid, retryErrorPatterns: undefined } },
+		{ name: "retryErrorPatterns not an array", candidate: { ...valid, retryErrorPatterns: "terminated" } },
+		{ name: "retryErrorPatterns non-string entry", candidate: { ...valid, retryErrorPatterns: [42] } },
+		{ name: "retryErrorPatterns empty entry", candidate: { ...valid, retryErrorPatterns: [""] } },
+		{ name: "retryErrorPatterns invalid regex", candidate: { ...valid, retryErrorPatterns: ["(unclosed"] } },
 	];
 
 	for (const { name, candidate } of cases) {
@@ -98,8 +113,8 @@ test("validateConfig fails closed for invalid values", () => {
 
 test("validateConfig accepts Node's maximum timer delay", () => {
 	assert.deepEqual(
-		validateConfig({ blockIsObject: true, enabled: true, firstEventMs: MAX_TIMER_MS, warningMs: 1, recoveryMs: MAX_TIMER_MS, maxStallRetries: 0, models: {} }),
-		{ ok: true, config: { enabled: true, firstEventMs: MAX_TIMER_MS, warningMs: 1, recoveryMs: MAX_TIMER_MS, maxStallRetries: 0, models: {} } },
+		validateConfig({ blockIsObject: true, enabled: true, firstEventMs: MAX_TIMER_MS, warningMs: 1, recoveryMs: MAX_TIMER_MS, maxStallRetries: 0, models: {}, retryErrorPatterns: [] }),
+		{ ok: true, config: { enabled: true, firstEventMs: MAX_TIMER_MS, warningMs: 1, recoveryMs: MAX_TIMER_MS, maxStallRetries: 0, models: {}, retryErrorPatterns: [] } },
 	);
 });
 
@@ -139,7 +154,7 @@ test("settings layers let valid project values repair invalid global shape and f
 		(cwd) => {
 			assert.deepEqual(resolveWatchdogConfig(cwd), {
 				ok: true,
-				config: { enabled: true, firstEventMs: 20_000, warningMs: 10, recoveryMs: 20, maxStallRetries: 3, models: {} },
+				config: { enabled: true, firstEventMs: 20_000, warningMs: 10, recoveryMs: 20, maxStallRetries: 3, models: {}, retryErrorPatterns: DEFAULT_RETRY_ERROR_PATTERNS },
 			});
 		},
 	);
@@ -160,7 +175,7 @@ test("maxStallRetries defaults to layered retry.maxRetries and explicit config w
 		(cwd) => {
 			assert.deepEqual(resolveWatchdogConfig(cwd), {
 				ok: true,
-				config: { enabled: true, firstEventMs: 20_000, warningMs: 10, recoveryMs: 20, maxStallRetries: 5, models: {} },
+				config: { enabled: true, firstEventMs: 20_000, warningMs: 10, recoveryMs: 20, maxStallRetries: 5, models: {}, retryErrorPatterns: DEFAULT_RETRY_ERROR_PATTERNS },
 			});
 		},
 	);
@@ -240,10 +255,10 @@ test("unknown watchdog field is reported by the settings lint and the default fi
 		const warnings: string[] = [];
 		assert.deepEqual(resolveWatchdogConfig(cwd, (m) => warnings.push(m)), {
 			ok: true,
-			config: { enabled: true, firstEventMs: 20_000, warningMs: 120_000, recoveryMs: 240_000, maxStallRetries: 3, models: {} },
+			config: { enabled: true, firstEventMs: 20_000, warningMs: 120_000, recoveryMs: 240_000, maxStallRetries: 3, models: {}, retryErrorPatterns: DEFAULT_RETRY_ERROR_PATTERNS },
 		});
 		assert.equal(warnings.length, 1);
-		assert.ok(warnings[0].includes(`unknown piWatchdog keys "timeoutMs" ignored; accepted: enabled, firstEventMs, warningMs, recoveryMs, maxStallRetries, models`));
+		assert.ok(warnings[0].includes(`unknown piWatchdog keys "timeoutMs" ignored; accepted: enabled, firstEventMs, warningMs, recoveryMs, maxStallRetries, models, retryErrorPatterns`));
 	});
 });
 
@@ -323,6 +338,7 @@ test("thresholdsFor matches globs case-insensitively against provider/id, first 
 		recoveryMs: 240_000,
 		maxStallRetries: 3,
 		models: { "LMStudio/*": { firstEventMs: 600_000 }, "openai/gpt-5.4": { warningMs: 300_000, recoveryMs: 600_000 } },
+		retryErrorPatterns: [],
 	};
 	assert.deepEqual(thresholdsFor(config, { provider: "lmstudio", id: "qwen3-30b" }), { firstEventMs: 600_000, warningMs: 120_000, recoveryMs: 240_000 });
 	assert.deepEqual(thresholdsFor(config, { provider: "openai", id: "gpt-5.4" }), { firstEventMs: 20_000, warningMs: 300_000, recoveryMs: 600_000 });
@@ -413,7 +429,7 @@ test("config warnings: unknown piWatchdog keys reach announce", () => {
 test("enabled by default when no piWatchdog settings exist", () => {
 	withSettings({}, {}, (cwd) => {
 		const result = resolveWatchdogConfig(cwd);
-		assert.deepEqual(result, { ok: true, config: { enabled: true, firstEventMs: 20_000, warningMs: 120_000, recoveryMs: 240_000, maxStallRetries: 3, models: {} } });
+		assert.deepEqual(result, { ok: true, config: { enabled: true, firstEventMs: 20_000, warningMs: 120_000, recoveryMs: 240_000, maxStallRetries: 3, models: {}, retryErrorPatterns: DEFAULT_RETRY_ERROR_PATTERNS } });
 	});
 	withSettings({}, { piWatchdog: false }, (cwd) => {
 		const result = resolveWatchdogConfig(cwd);
@@ -973,7 +989,7 @@ test("exhaustion after native-style continuation and stale-runtime synchronous s
 	});
 });
 
-type RuntimeScript = "tool" | "stall" | "slow" | "success";
+type RuntimeScript = "tool" | "stall" | "slow" | "success" | "gatewayError" | "quotaError";
 
 function deferred<T = void>() {
 	let resolve!: (value: T | PromiseLike<T>) => void;
@@ -991,7 +1007,7 @@ async function waitBounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	finally { if (timeout) clearTimeout(timeout); }
 }
 
-async function runtimeWatchdogHarness(scripts: RuntimeScript[], retryEnabled = true, opts: { maxStallRetries?: number; maxRetries?: number; mode?: "tui" | "print"; withUI?: boolean } = {}) {
+async function runtimeWatchdogHarness(scripts: RuntimeScript[], retryEnabled = true, opts: { maxStallRetries?: number; maxRetries?: number; mode?: "tui" | "print"; withUI?: boolean; extensionsBefore?: Array<(pi: any) => void> } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "pi-watchdog-runtime-"));
 	const agentDir = join(root, "agent");
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -1011,6 +1027,7 @@ async function runtimeWatchdogHarness(scripts: RuntimeScript[], retryEnabled = t
 				const aborted = () => stream.push({ type: "error", reason: "aborted", error: { ...runtimeAssistant([]), stopReason: "aborted", errorMessage: "aborted" } });
 				if (options?.signal?.aborted) return aborted();
 				if (scripts[index] === "stall") { options?.signal?.addEventListener("abort", aborted, { once: true }); return; }
+				if (scripts[index] === "gatewayError" || scripts[index] === "quotaError") { stream.push({ type: "start", partial: runtimeAssistant([]) }); stream.push({ type: "error", reason: "error", error: { ...runtimeAssistant([]), stopReason: "error", errorMessage: scripts[index] === "gatewayError" ? "terminated" : "insufficient_quota: ended before local completion" } }); return; }
 				if (scripts[index] === "slow") { stream.push({ type: "start", partial: runtimeAssistant([]) }); options?.signal?.addEventListener("abort", aborted, { once: true }); return; }
 				const message = scripts[index] === "tool" ? runtimeAssistant([{ type: "toolCall", id: "watchdog-tool-call", name: "watchdog_tool", arguments: {} }], "toolUse") : runtimeAssistant([{ type: "text", text: "recovered" }]);
 				stream.push({ type: "start", partial: message }); stream.push({ type: "done", reason: message.stopReason, message });
@@ -1019,7 +1036,7 @@ async function runtimeWatchdogHarness(scripts: RuntimeScript[], retryEnabled = t
 		} });
 		const model = runtime.getModel("watchdog-test", "watchdog-test-model")!;
 		const settingsManager = SettingsManager.create(root, agentDir);
-		const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: [piWatchdog] });
+		const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: [...(opts.extensionsBefore ?? []), piWatchdog] });
 		await loader.reload();
 		const { session } = await createAgentSession({ cwd: root, modelRuntime: runtime, model, settingsManager, resourceLoader: loader, sessionManager: SessionManager.inMemory(root), customTools: [defineTool({ name: "watchdog_tool", label: "watchdog tool", description: "test", parameters: Type.Object({}), execute: async () => { toolCalls += 1; return { content: [{ type: "text", text: "tool complete" }], details: undefined }; } })] });
 		// InteractiveMode editor restoration is upstream Pi behavior; this pins the watchdog's public abort binding.
@@ -1363,4 +1380,71 @@ test("both synthetic timeout errors satisfy Pi's own retry predicate", () => {
 			`Pi must classify "${errorMessage}" as retryable, or the watchdog's conversion degrades to manual resubmission`,
 		);
 	}
+});
+
+test("retryableErrorMessage makes the SF LLM Gateway stream error retryable for Pi, and only that", () => {
+	const gateway = { role: "assistant", stopReason: "error", errorMessage: SF_GATEWAY_STREAM_ERROR };
+	assert.equal(isRetryableAssistantError(gateway as never), false, "precondition: Pi alone does not retry the rewritten gateway error");
+	const rewritten = retryableErrorMessage(gateway, DEFAULT_RETRY_ERROR_PATTERNS);
+	assert.equal(rewritten, `${SF_GATEWAY_STREAM_ERROR}\n${RETRYABLE_MARKER}`, "original text is preserved and the marker appended");
+	assert.equal(isRetryableAssistantError({ ...gateway, errorMessage: rewritten } as never), true);
+	assert.equal(retryableErrorMessage({ ...gateway, errorMessage: rewritten }, DEFAULT_RETRY_ERROR_PATTERNS), undefined, "idempotent: an already-marked error is left alone");
+
+	const cases: Array<[string, { role: string; stopReason?: string; errorMessage?: string }]> = [
+		["already retryable", { role: "assistant", stopReason: "error", errorMessage: "terminated" }],
+		["unmatched error", { role: "assistant", stopReason: "error", errorMessage: "invalid_request: bad schema" }],
+		["aborted", { role: "assistant", stopReason: "aborted", errorMessage: SF_GATEWAY_STREAM_ERROR }],
+		["success", { role: "assistant", stopReason: "stop" }],
+		["non-assistant", { role: "user", stopReason: "error", errorMessage: SF_GATEWAY_STREAM_ERROR }],
+		["quota exhaustion stays terminal", { role: "assistant", stopReason: "error", errorMessage: "insufficient_quota: ended before local completion" }],
+	];
+	for (const [name, message] of cases) assert.equal(retryableErrorMessage(message, DEFAULT_RETRY_ERROR_PATTERNS), undefined, name);
+	assert.equal(retryableErrorMessage({ role: "assistant", stopReason: "error", errorMessage: "Gateway hiccup 0x7" } as never, []), undefined, "no patterns, no rewrite");
+	assert.ok(retryableErrorMessage({ role: "assistant", stopReason: "error", errorMessage: "Gateway HICCUP 0x7" }, ["gateway hiccup"]), "custom patterns are case-insensitive");
+});
+
+test("message_end rewrites a matched provider error and leaves watchdog-owned conversions intact", () => {
+	withEnabledWatchdog((cwd) => {
+		const h = watchdogHarness("tui", cwd);
+		h.emit("before_provider_request"); h.emit("message_start", messageStart());
+		const message = { role: "assistant", stopReason: "error", errorMessage: SF_GATEWAY_STREAM_ERROR, keep: 1 };
+		assert.deepEqual(h.emit("message_end", { message }), { message: { ...message, errorMessage: `${SF_GATEWAY_STREAM_ERROR}\n${RETRYABLE_MARKER}` } });
+		assert.equal(h.emit("turn_end", { messageEntryId: "e", entries: [] }), undefined, "Pi's native retry owns the omission, not the watchdog");
+		h.newController(); h.emit("before_provider_request"); h.emit("message_start", messageStart());
+		assert.equal(h.emit("message_end", { message: { role: "assistant", stopReason: "error", errorMessage: "invalid_request" } }), undefined);
+	});
+	withSettings({}, { piWatchdog: false }, (cwd) => {
+		const h = watchdogHarness("tui", cwd);
+		h.emit("before_provider_request");
+		assert.equal(h.emit("message_end", { message: { role: "assistant", stopReason: "error", errorMessage: SF_GATEWAY_STREAM_ERROR } }), undefined, "disabled watchdog never rewrites");
+	});
+});
+
+// Mirrors sf-llm-gateway's message_end diagnostics: it rewrites a raw "terminated" into prose Pi no longer retries.
+const fakeGatewayDiagnostics = (pi: any) => pi.on("message_end", (event: any) =>
+	event.message.role === "assistant" && event.message.stopReason === "error" && event.message.errorMessage === "terminated"
+		? { message: { ...event.message, errorMessage: SF_GATEWAY_STREAM_ERROR } }
+		: undefined);
+
+test("installed runtime retries the SF LLM Gateway stream-ended error through Pi's native retry", async () => {
+	const h = await runtimeWatchdogHarness(["gatewayError", "success"], true, { maxRetries: 2, extensionsBefore: [fakeGatewayDiagnostics] });
+	try {
+		await waitBounded(h.session.prompt("start"), "gateway error run"); await waitBounded(h.session.waitForIdle(), "retried run");
+		assert.equal(h.contexts.length, 2, "the failed request was retried");
+		assert.equal(h.lastBranchAssistant()?.stopReason, "stop");
+		const projected = h.projectedContext();
+		assert.equal(projected.filter((m: any) => m.role === "assistant" && m.stopReason === "error").length, 0, "the failed attempt is omitted from model context");
+		assert.equal(projected.filter((m: any) => m.role === "custom" && m.customType === REDRIVE.customType).length, 0, "native retry, not a watchdog re-drive");
+		const failed = (h.session as any).sessionManager.getBranch().find((e: any) => e.type === "message" && e.message.stopReason === "error")?.message;
+		assert.ok(failed?.errorMessage.startsWith(SF_GATEWAY_STREAM_ERROR), "the transcript keeps the gateway's guidance");
+	} finally { h.dispose(); }
+});
+
+test("installed runtime does not retry a quota error even when it matches a retry pattern", async () => {
+	const h = await runtimeWatchdogHarness(["quotaError", "success"], true, { maxRetries: 2 });
+	try {
+		await waitBounded(h.session.prompt("start"), "quota error run"); await waitBounded(h.session.waitForIdle(), "settled");
+		assert.equal(h.contexts.length, 1);
+		assert.equal(h.lastBranchAssistant()?.stopReason, "error");
+	} finally { h.dispose(); }
 });

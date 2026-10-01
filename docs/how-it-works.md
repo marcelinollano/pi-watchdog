@@ -1,6 +1,6 @@
 # pi-watchdog: how it works
 
-Opt-in recovery from provider requests that stall: no first stream event within `firstEventMs` (every mode), or no parsed semantic progress for `recoveryMs` mid-stream (TUI only). Settings live under `piWatchdog` in `settings.json`; see [`README.md`](../README.md#configuration). This guide covers what happens after the watchdog aborts.
+Recovery from provider requests that stall or fail transiently: no first stream event within `firstEventMs` (every mode), or no parsed semantic progress for `recoveryMs` mid-stream (TUI only). Settings live under `piWatchdog` in `settings.json`; see [`README.md`](../README.md#configuration). This guide covers what happens after the watchdog aborts.
 
 ## Why the watchdog re-drives the request itself
 
@@ -31,6 +31,14 @@ Read live from the layered `settings.json` files at each stall (pi's own default
 |`retry.maxRetries`|`3`|only as the default for `piWatchdog.maxStallRetries`, read once per session|
 
 `maxStallRetries` is the single re-issue cap. When it is exhausted the exhausted notice prints at the abort and the degradation notice (`The stalled request was stopped, but Pi did not start an automatic retry. Retry may be disabled, exhausted, or incompatible; submit the message again to retry manually.`) prints when the run settles; the final attempt stays `aborted` in the transcript.
+
+## Transient errors Pi does not classify as retryable
+
+Not every failure is an abort. A provider can end a request with `stopReason: "error"` and wording that Pi's `isRetryableAssistantError` does not match. `sf-llm-gateway`'s `message_end` diagnostics, for example, rewrite a raw `terminated` into `SF LLM Gateway stream for <model> ended before local completion. This is a retryable transport failure...`, which no longer contains any of Pi's retryable keywords.
+
+Pi's retry is not fenced here, because nothing called `abort()`. The watchdog therefore uses Pi's native retry and does not re-drive. In its own `message_end` handler, if the error matches one of `piWatchdog.retryErrorPatterns` and Pi would not already retry it, the watchdog appends `[pi-watchdog: transient transport failure - stream terminated early; retrying]` to `errorMessage`. That marker contains `terminated`, so Pi's `_handlePostAgentRun` retries with `retry.baseDelayMs`/`maxAgentDelayMs` backoff under `retry.maxRetries`, and leaves the failed attempt out of the model's context. The rewrite is skipped when the marked text would still be non-retryable (quota or billing exhaustion), when the error is already retryable, and when the watchdog is disabled.
+
+`message_end` handlers run in extension load order, each one seeing the previous handler's result. The provider's rewrite must therefore run first: list pi-watchdog after the provider's package in `packages`.
 
 ## What the model and the transcript see
 

@@ -15,6 +15,7 @@ A provider-stall watchdog for [Pi](https://github.com/earendil-works/pi). If a m
 |---|---|---|
 | No response at all | no first stream event within `firstEventMs` (20s) | all (TUI, RPC, print, JSON) |
 | Goes quiet mid-answer | no text, thinking or tool-call delta: warns at `warningMs` (2m), recovers at `recoveryMs` (4m) | TUI only |
+| Fails with a transient error Pi doesn't recognize | error text matches `retryErrorPatterns`, e.g. SF LLM Gateway's `...ended before local completion` | all |
 
 When it recovers a stalled request, it:
 
@@ -24,6 +25,8 @@ When it recovers a stalled request, it:
 4. sends a hidden user message: *"The previous provider request stalled before completing and was retried automatically. Continue."*
 
 You can cancel the retry during the countdown by typing a new prompt, running `/compact` or `/tree`, or pressing Esc. A successful turn resets the retry counter.
+
+**Transient errors Pi misses:** some provider extensions reword transport failures so Pi's retry classifier no longer recognizes them. For example, `sf-llm-gateway` turns a dropped stream (`terminated`) into *"SF LLM Gateway stream for … ended before local completion. This is a retryable transport failure…"*, which Pi treats as final. When an error matches `retryErrorPatterns`, the watchdog appends a marker to the error text so Pi's own retry handles it, with the usual `retry.*` backoff and `retry.maxRetries` budget, and the failed attempt left out of the model's context. The gateway's original guidance stays visible. Quota and billing errors are never made retryable. This works only if pi-watchdog is listed **after** the provider's package in `packages`, so it sees the reworded message.
 
 **Why it restarts the run itself instead of using Pi's built-in retry:** since Pi 0.86, an abort ends the whole run, so Pi's retry loop never runs after an extension aborts a request. See [docs/how-it-works.md](docs/how-it-works.md).
 
@@ -60,7 +63,11 @@ The watchdog is **on by default**. To change its behavior, add a `piWatchdog` ke
     "maxStallRetries": 3,     // defaults to retry.maxRetries; 0 = detect and stop, never retry
     "models": {               // per-model overrides; glob matched against "provider/model-id"; first match wins
       "sf-llm-gateway/*opus*": { "firstEventMs": 60000, "recoveryMs": 300000 }
-    }
+    },
+    "retryErrorPatterns": [   // case-insensitive regexes for transient errors Pi doesn't retry on its own; [] turns this off
+      "ended before local completion",
+      "retryable transport failure"
+    ]
   }
 }
 ```
@@ -84,8 +91,9 @@ To reproduce a stall by hand with a fake provider that hangs, see [docs/how-it-w
 - **Settings key:** `piWatchdog` at the top level, instead of `quiver.providerStallWatchdog`.
 - **On by default:** in upstream you have to turn it on.
 - **Names:** the status key and custom message type are renamed to `pi-watchdog`.
+- **Transient-error retry:** new `retryErrorPatterns` option, which passes reworded transport errors (such as SF LLM Gateway's) to Pi's native retry.
 
-The detection and recovery logic is otherwise unchanged from upstream.
+The stall detection and recovery logic is otherwise unchanged from upstream.
 
 ## Credits & license
 
