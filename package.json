@@ -1,0 +1,28 @@
+{
+  "name": "pi-watchdog",
+  "version": "0.1.0",
+  "description": "Provider-stall watchdog for Pi: aborts hung model requests and automatically re-drives the run with a hidden \"Continue.\" so you don't have to.",
+  "type": "module",
+  "license": "MIT",
+  "main": "src/index.ts",
+  "files": ["src", "docs", "README.md", "LICENSE"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "keywords": ["pi-package", "pi-extension", "watchdog", "retry", "stall", "bedrock"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.99.2",
+    "@earendil-works/pi-coding-agent": "^0.99.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
